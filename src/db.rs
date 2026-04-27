@@ -52,8 +52,29 @@ pub enum DbError {
 }
 
 /// Open a connection to `db_path` and ensure the schema is applied.
+///
+/// Tunes SQLite for a password store (durability over throughput):
+///
+/// * `journal_mode=WAL` — write-ahead-log avoids the rollback-journal
+///   "delete the journal then rename the DB" dance whose mid-rename
+///   crash window is famously corruption-prone. WAL also lets readers
+///   and writers coexist, which the pwm CLI doesn't strictly need but
+///   costs nothing.
+/// * `synchronous=FULL` — fsync every commit. On a password store the
+///   user always prefers "your last write definitely landed" over
+///   throughput. The default `FULL` already matches what we want, but
+///   we set it explicitly so a user-tweaked SQLite build cannot
+///   downgrade us.
+/// * `foreign_keys=ON` — schema doesn't currently use foreign keys, but
+///   future migrations might; turning the check on here is the safe
+///   default.
 pub fn open(db_path: &Path) -> Result<Connection, DbError> {
     let conn = Connection::open(db_path)?;
+    // pragma_update is the right rusqlite API for these — it goes
+    // through a prepared statement so SQLite parses it properly.
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let _ = conn.pragma_update(None, "synchronous", "FULL");
+    let _ = conn.pragma_update(None, "foreign_keys", "ON");
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }

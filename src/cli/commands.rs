@@ -279,6 +279,11 @@ fn export(manager: &mut PasswordManager, path: &str) -> Result<i32> {
     read_master_for_existing(manager)?;
     let n = manager.export_to_json(path)?;
     println!("Експортовано {n} акаунтів у {path}.");
+    eprintln!(
+        "Увага: файл {path:?} містить ВСІ паролі у відкритому вигляді. \
+         На Unix його створено з режимом 0600 (тільки власник). \
+         Видаліть його після використання."
+    );
     Ok(0)
 }
 
