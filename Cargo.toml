@@ -19,6 +19,20 @@ path = "src/lib.rs"
 name = "pwm"
 path = "src/main.rs"
 
+# Optional desktop GUI front-end. Built only with `--features gui`; the
+# default `cargo build` keeps the lean CLI-only behaviour.
+[[bin]]
+name = "pwm-gui"
+path = "src/bin/pwm_gui/main.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+# Toggles the optional graphical front-end (eframe/egui + native file
+# picker + clipboard). Adds ~10–15 MiB to the GUI binary; the CLI
+# binary `pwm` is unaffected either way.
+gui = ["dep:eframe", "dep:egui", "dep:arboard", "dep:rfd"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -45,6 +59,17 @@ rand = "0.8"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# --- GUI-only deps (gated behind the `gui` feature) ---
+# `egui` is the immediate-mode UI toolkit; `eframe` is its windowing /
+# event-loop wrapper that runs on Linux/macOS/Windows. We pin the
+# feature set explicitly to keep the dep tree small.
+eframe = { version = "0.27", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = { version = "0.27", optional = true }
+# Native file open/save dialogs (used for export/import).
+rfd = { version = "0.14", optional = true }
+# Cross-platform clipboard for "copy password" buttons.
+arboard = { version = "3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

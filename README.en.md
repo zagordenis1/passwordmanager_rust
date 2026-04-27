@@ -60,6 +60,31 @@ in TTY mode (no echo, never persisted in shell history) and from a
 single stdin line in non-TTY mode (so `echo "pw" | pwm get foo` works
 in scripts and tests).
 
+## Optional GUI front-end (`pwm-gui`)
+
+The repo ships an **optional** desktop GUI built on egui/eframe that
+shares the same `passwordmanagerrs` library and `users.db` format,
+so the CLI and GUI can be mixed freely. It is gated behind the `gui`
+feature so a plain `cargo build` stays small and CLI-only.
+
+```bash
+# Linux only — install dev headers for the GPU backend + native dialogs
+sudo apt install libgtk-3-dev libxkbcommon-dev libxcb-render0-dev \
+                 libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev libssl-dev
+
+cargo build --release --features gui --bin pwm-gui
+./target/release/pwm-gui                                  # uses ./users.db
+./target/release/pwm-gui /home/user/.local/share/pwm/users.db
+```
+
+The GUI provides feature parity with the CLI: first-time master setup,
+unlock, account list with live search, add (with inline generator),
+reveal/copy with 30 s clipboard auto-clear, update, delete with
+confirmation, change-master, native-dialog export/import, standalone
+generator, and `PM_AUTO_LOCK_SECONDS`-driven auto-lock plus a manual
+**Lock** button. Release binary is ~15–17 MiB; the CLI binary `pwm`
+is unaffected when the feature is off.
+
 ## Auto-lock
 
 The interactive menu enforces an idle timeout. Configure it via
