@@ -602,7 +602,6 @@ dependencies = [
  "rand",
  "rpassword",
  "rusqlite",
- "secrecy",
  "serde",
  "serde_json",
  "sha2",
@@ -807,15 +806,6 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "secrecy"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bd1c54ea06cfd2f6b63219704de0b9b4f72dcc2b8fdef820be6cd799780e91e"
-dependencies = [
- "zeroize",
 ]
 
 [[package]]

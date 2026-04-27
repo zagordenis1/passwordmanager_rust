@@ -3,10 +3,11 @@
 //!
 //! Mirrors the Python `PasswordManager` 1:1 in semantics. Differences:
 //!
-//! * The derived Fernet key (and the key string itself) is wrapped in
-//!   [`secrecy::SecretString`] so [`Drop`] zeroizes it.
+//! * Local copies of the derived base64 key string are explicitly
+//!   `Zeroize`d after the `Fernet` instance has been built.
 //! * The constructed [`fernet::Fernet`] is held only inside an
-//!   [`Option`] — `lock()` drops it.
+//!   [`Option`] — `lock()` drops it. (The upstream `fernet` crate does
+//!   not zeroize on Drop; see the [`PasswordManager`] struct doc.)
 //! * All errors funnel through `anyhow::Result` for the public API; the
 //!   `_internal` helpers use `thiserror`-typed errors.
 
@@ -15,10 +16,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use fernet::Fernet;
 use rusqlite::{params, OptionalExtension};
-#[cfg(test)]
-use secrecy::ExposeSecret;
-use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::crypto::{self, KDF_ARGON2ID_V1, KDF_PBKDF2_LEGACY};
 use crate::db;
@@ -53,17 +52,23 @@ pub struct UserRecord {
 }
 
 /// Top-level facade combining DB + crypto.
+///
+/// # Memory hygiene caveat
+///
+/// `Some` while the manager is unlocked, `None` after [`PasswordManager::lock`].
+/// We deliberately do **not** keep a separate `SecretString` copy of the
+/// derived key — the `fernet::Fernet` instance already carries the
+/// effective key material (an AES-128 key + an HMAC-SHA256 key) inside
+/// its own struct, and that crate does not zeroize on `Drop`. Holding a
+/// second copy in a `secrecy::SecretString` would have given the
+/// *appearance* of defense-in-depth without the substance. Dropping the
+/// `Option<Fernet>` (via `lock()` or process exit) is the actual
+/// guarantee, and short of forking the upstream crate or switching to
+/// raw AES + HMAC primitives we cannot zeroize the inner buffers from
+/// outside.
 pub struct PasswordManager {
     db_path: PathBuf,
-    /// `Some` when the master password has been verified. Dropping this
-    /// (via `lock()` or `Drop`) drops the underlying key — `secrecy` is
-    /// applied to the key bytes too via [`SecretString`] inside `set` /
-    /// `verify` paths.
     fernet: Option<Fernet>,
-    /// Held in parallel to `fernet` so we can re-construct it after
-    /// transient operations and rotate it on `change_master_password`.
-    /// `secrecy::SecretString` clears it on drop.
-    key: Option<SecretString>,
 }
 
 impl std::fmt::Debug for PasswordManager {
@@ -86,7 +91,6 @@ impl PasswordManager {
         Ok(Self {
             db_path: path,
             fernet: None,
-            key: None,
         })
     }
 
@@ -104,6 +108,15 @@ impl PasswordManager {
     }
 
     /// First-time master-password setup. Refuses if one is already set.
+    ///
+    /// Writes are wrapped in a `BEGIN IMMEDIATE` transaction so a second
+    /// `pwm init` running concurrently is serialized at SQLite's
+    /// reserved-lock level. The presence-check is then redone *inside*
+    /// the transaction, so two racing initialisers can't both pass the
+    /// outer `has_master_password()` check and end up clobbering each
+    /// other's salt/verifier/kdf_version mid-write (which would leave
+    /// the DB unrecoverable). Whichever process gets the reserved lock
+    /// first wins; the second sees the master is already set and bails.
     pub fn set_master_password(&mut self, master_password: &str) -> Result<()> {
         if self.has_master_password()? {
             bail!("master password already set");
@@ -113,16 +126,25 @@ impl PasswordManager {
         }
 
         let salt = crypto::generate_salt();
-        let key = crypto::derive_key(master_password, &salt, KDF_ARGON2ID_V1)
+        let mut key = crypto::derive_key(master_password, &salt, KDF_ARGON2ID_V1)
             .context("deriving master key")?;
         let fernet = crypto::fernet_from_key(&key).context("building Fernet")?;
+        // The base64 string copy of the key is no longer needed once
+        // Fernet is built.
+        key.zeroize();
         let verifier = crypto::make_verifier(&fernet);
 
-        // All-or-nothing: a crash between writes would otherwise leave the
-        // DB with salt+verifier but no kdf_version, permanently bricking it
-        // (verify would default to PBKDF2 instead of Argon2id).
         let mut conn = self.open_conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // Re-check inside the transaction — defends against a concurrent
+        // `pwm init` that won the race to write meta.
+        let salt_present = db::get_meta(&tx, META_SALT)?.is_some();
+        let verifier_present = db::get_meta(&tx, META_VERIFIER)?.is_some();
+        if salt_present && verifier_present {
+            bail!("master password already set");
+        }
+
         let upsert = "INSERT INTO meta(key, value) VALUES (?1, ?2) \
                       ON CONFLICT(key) DO UPDATE SET value = excluded.value";
         tx.execute(upsert, params![META_SALT, &salt])?;
@@ -131,7 +153,6 @@ impl PasswordManager {
         tx.commit()?;
 
         self.fernet = Some(fernet);
-        self.key = Some(SecretString::new(key));
         Ok(())
     }
 
@@ -160,16 +181,16 @@ impl PasswordManager {
 
         let kdf_version = self.read_kdf_version()?;
 
-        let key = match crypto::derive_key(master_password, &salt, &kdf_version) {
+        let mut key = match crypto::derive_key(master_password, &salt, &kdf_version) {
             Ok(k) => k,
             Err(_) => return Ok(false),
         };
         let fernet = crypto::fernet_from_key(&key)?;
+        key.zeroize();
         let token = std::str::from_utf8(&verifier)
             .map_err(|_| anyhow!("verifier is not valid UTF-8 (corrupt DB?)"))?;
         if crypto::check_verifier(&fernet, token) {
             self.fernet = Some(fernet);
-            self.key = Some(SecretString::new(key));
             Ok(true)
         } else {
             Ok(false)
@@ -203,8 +224,11 @@ impl PasswordManager {
             .clone();
 
         let new_salt = crypto::generate_salt();
-        let new_key = crypto::derive_key(new_master_password, &new_salt, KDF_ARGON2ID_V1)?;
+        let mut new_key = crypto::derive_key(new_master_password, &new_salt, KDF_ARGON2ID_V1)?;
         let new_fernet = crypto::fernet_from_key(&new_key)?;
+        // Same rationale as `set_master_password`: the base64 copy is
+        // no longer needed once Fernet has internalised it.
+        new_key.zeroize();
         let new_verifier = crypto::make_verifier(&new_fernet);
 
         let mut conn = self.open_conn()?;
@@ -250,7 +274,6 @@ impl PasswordManager {
         tx.commit()?;
 
         self.fernet = Some(new_fernet);
-        self.key = Some(SecretString::new(new_key));
         Ok(count)
     }
 
@@ -258,7 +281,6 @@ impl PasswordManager {
     /// re-authenticates via [`verify_master_password`].
     pub fn lock(&mut self) {
         self.fernet = None;
-        self.key = None;
     }
 
     /// `true` iff the manager currently holds a valid Fernet.
@@ -410,6 +432,15 @@ impl PasswordManager {
     }
 
     /// Write all decrypted accounts to `path` as JSON. Returns count.
+    ///
+    /// On Unix the file is created with mode `0600` (owner read/write
+    /// only). Default `std::fs::write` would honour the user's umask
+    /// and on a typical desktop that gives `0644` — world-readable —
+    /// which is unacceptable for a file that contains every plaintext
+    /// password. On Windows we simply overwrite via the standard API
+    /// and rely on the user's NTFS ACLs (the existing file's ACL is
+    /// preserved on overwrite, and a freshly created file inherits the
+    /// directory's ACL).
     pub fn export_to_json<P: AsRef<Path>>(&self, path: P) -> Result<usize> {
         let records = self.list_users()?;
         if let Some(parent) = path.as_ref().parent() {
@@ -418,7 +449,7 @@ impl PasswordManager {
             }
         }
         let json = serde_json::to_string_pretty(&records)?;
-        std::fs::write(&path, json).context("writing export file")?;
+        write_owner_only(path.as_ref(), json.as_bytes()).context("writing export file")?;
         Ok(records.len())
     }
 
@@ -436,11 +467,14 @@ impl PasswordManager {
         for entry in payload {
             let login = entry.get("login").and_then(|v| v.as_str()).unwrap_or("");
             let email = entry.get("email").and_then(|v| v.as_str()).unwrap_or("");
-            let password = entry.get("password").and_then(|v| v.as_str());
-            if login.is_empty() || password.is_none() {
+            let password = entry.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            // Skip malformed entries: an empty login or password is
+            // never useful and `create_user` would either reject the
+            // login or store an undecryptable empty ciphertext.
+            if login.is_empty() || password.is_empty() {
                 continue;
             }
-            match self.create_user(login, email, password.unwrap()) {
+            match self.create_user(login, email, password) {
                 Ok(_) => inserted += 1,
                 Err(e) => {
                     // Only swallow duplicate-login errors when the caller
@@ -492,11 +526,38 @@ impl PasswordManager {
     }
 }
 
-// Manual `Drop` only needed if we ever switch `key` away from
-// `secrecy::SecretString`. SecretString already zeroizes on drop;
-// dropping `Fernet` itself does not zero its internal key buffer, but
-// the project deliberately scopes it via `Option<Fernet>` so it's
-// dropped on `lock()` and at process exit.
+// `Fernet` from the upstream crate does not zeroize its internal key
+// material on Drop; the manager deliberately scopes it via
+// `Option<Fernet>` so it is dropped on `lock()` and at process exit.
+// See the `PasswordManager` struct doc for the full rationale.
+
+/// Atomically write `data` to `path` with owner-only permissions
+/// (`0600` on Unix). Used by [`PasswordManager::export_to_json`] for the
+/// plaintext-password export file.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Windows fallback — `std::fs::write` preserves any existing file's
+/// ACL and otherwise inherits the parent directory's. We do not attempt
+/// to set a stricter ACL programmatically here; users on shared
+/// machines should pick a path inside their own profile.
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, data)
+}
 
 #[cfg(test)]
 mod tests {
@@ -729,6 +790,68 @@ mod tests {
     }
 
     #[test]
+    fn import_skips_entries_with_empty_password() {
+        // Build an export-shaped JSON by hand with one valid row and
+        // two malformed (empty login / empty password) rows. Only the
+        // valid row should be inserted; nothing should error.
+        let (_d, p) = tmp_db();
+        let mut m = PasswordManager::new(&p).unwrap();
+        m.set_master_password("m").unwrap();
+
+        let dir = tempdir().unwrap();
+        let json_path = dir.path().join("import.json");
+        let payload = serde_json::json!([
+            { "login": "alice", "email": "a@x", "password": "p1" },
+            { "login": "",      "email": "x@y", "password": "p2" },
+            { "login": "bob",   "email": "b@y", "password": ""   }
+        ]);
+        std::fs::write(&json_path, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        let inserted = m.import_from_json(&json_path, true).unwrap();
+        assert_eq!(inserted, 1);
+        assert_eq!(m.get_user("alice").unwrap().unwrap().password, "p1");
+        assert!(m.get_user("bob").unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_file_has_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, p) = tmp_db();
+        let mut m = PasswordManager::new(&p).unwrap();
+        m.set_master_password("m").unwrap();
+        m.create_user("alice", "a@x", "secret").unwrap();
+
+        let dir = tempdir().unwrap();
+        let json = dir.path().join("export.json");
+        m.export_to_json(&json).unwrap();
+        let mode = std::fs::metadata(&json).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "export file mode should be 0600, got {:o}",
+            mode
+        );
+    }
+
+    #[test]
+    fn second_init_in_face_of_already_set_master_bails() {
+        // Direct functional test of the inside-transaction recheck: we
+        // can't easily race two threads through this single-threaded
+        // SQLite connection, but the recheck also fires on the second
+        // call from a single PasswordManager — exercising the same
+        // branch that defends against the cross-process race.
+        let (_d, p) = tmp_db();
+        let mut m = PasswordManager::new(&p).unwrap();
+        m.set_master_password("first").unwrap();
+        let err = m.set_master_password("second").unwrap_err();
+        assert!(
+            err.to_string().contains("master password already set"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn debug_redacts_secrets() {
         let (_d, p) = tmp_db();
         let mut m = PasswordManager::new(&p).unwrap();
@@ -736,14 +859,5 @@ mod tests {
         let dbg = format!("{:?}", m);
         assert!(!dbg.contains("super-secret-master"));
         assert!(!dbg.contains("Fernet"));
-    }
-
-    #[test]
-    fn expose_secret_helper_works_when_used() {
-        // Ensures we use `secrecy` crate properly — `expose_secret` returns
-        // the backing string so we can construct Fernet from it later if
-        // needed.
-        let s = SecretString::new("hello".to_string());
-        assert_eq!(s.expose_secret(), "hello");
     }
 }

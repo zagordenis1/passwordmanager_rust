@@ -328,7 +328,14 @@ fn export_json(manager: &mut PasswordManager) -> Result<(), UserAbort> {
         raw
     };
     match manager.export_to_json(&path) {
-        Ok(n) => println!("Експортовано {n} акаунтів у {path}."),
+        Ok(n) => {
+            println!("Експортовано {n} акаунтів у {path}.");
+            println!(
+                "Увага: файл містить ВСІ паролі у відкритому вигляді. \
+                 На Unix його створено з режимом 0600 (тільки власник). \
+                 Видаліть його після використання."
+            );
+        }
         Err(e) => println!("Помилка експорту: {e}"),
     }
     Ok(())
