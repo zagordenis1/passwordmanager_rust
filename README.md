@@ -1,153 +1,341 @@
-# `passwordmanagerrs` — Rust port of [`passwordmanagerpy`](https://github.com/zagordenis/passwordmanagerpy)
+# `passwordmanagerrs` — Rust-порт [`passwordmanagerpy`](https://github.com/zagordenis/passwordmanagerpy)
+
+**Мови:** **Українська** · [Русский](README.ru.md) · [English](README.en.md)
 
 [![CI](https://github.com/zagordenis1/passwordmanager_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/zagordenis1/passwordmanager_rust/actions/workflows/ci.yml)
 
-A small CLI password manager written in idiomatic Rust. It is
-**byte-compatible** with the original Python implementation: any database
-written by either side is readable by the other when the master password
-is the same. The default KDF is Argon2id; PBKDF2-SHA256 is preserved as
-a read-only legacy fallback for old DBs.
+Невеликий CLI-менеджер паролів, написаний на ідіоматичному Rust.
+**Побайтово сумісний** з оригінальною Python-реалізацією: будь-яку
+БД, створену однією зі сторін, можна відкрити іншою (за умови
+збігу master-пароля). Базовий KDF — Argon2id; PBKDF2-SHA256
+зберігається як read-only fallback для старих БД.
 
-## Quickstart
+---
+
+## Зміст
+
+1. [Встановлення Rust](#встановлення-rust)
+2. [Збірка та запуск](#збірка-та-запуск)
+3. [Інтерактивне меню](#інтерактивне-меню)
+4. [Не-інтерактивні підкоманди](#не-інтерактивні-підкоманди)
+5. [Auto-lock (автоматичне блокування)](#auto-lock-автоматичне-блокування)
+6. [Модель безпеки](#модель-безпеки)
+7. [Архітектура](#архітектура)
+8. [Тести](#тести)
+9. [Реліз-бінарник](#реліз-бінарник)
+10. [Міграція з Python-версії](#міграція-з-python-версії)
+11. [Ліцензія](#ліцензія)
+
+---
+
+## Встановлення Rust
+
+Якщо Rust ще не встановлено — найпростіший шлях через [rustup](https://rustup.rs/).
+
+### Linux / macOS
 
 ```bash
-# Build the static `pwm` binary (single executable, no system deps).
-cargo build --release
-
-# Interactive Ukrainian-language menu — exact UX of the Python original.
-./target/release/pwm
-
-# …or use one of the non-interactive subcommands (great for scripts).
-./target/release/pwm init
-./target/release/pwm add --login alice --email a@example.com
-./target/release/pwm get alice
-./target/release/pwm list --json
-./target/release/pwm gen --length 32
-./target/release/pwm change-master
-./target/release/pwm export users.json
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# Перезавантажте shell або виконайте:
+source "$HOME/.cargo/env"
+rustc --version   # має бути 1.74 або новіше
 ```
 
-The binary auto-creates `users.db` in the current working directory by
-default. Override with `--db /path/to/users.db` (also works inside the
-interactive mode).
+### Windows
 
-## Subcommands
+1. Завантажте `rustup-init.exe` зі сторінки https://rustup.rs/.
+2. Запустіть, оберіть варіант `default host triple` (зазвичай `x86_64-pc-windows-msvc`).
+3. Встановіть [Build Tools для Visual Studio](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (Microsoft C++ Build Tools) — потрібні для лінкера.
+4. Перевірте у новій PowerShell-сесії: `rustc --version`.
 
-| Command                   | What it does                                                        |
-|---------------------------|---------------------------------------------------------------------|
-| *(no subcommand)*         | Launch the interactive Ukrainian-language menu (11 items).          |
-| `pwm init`                | One-time master-password setup on a fresh DB.                       |
-| `pwm add --login <name>`  | Add an account. Password via hidden prompt or `--stdin`.            |
-| `pwm get <login>`         | Print the password to stdout (`--full` for the whole record).       |
-| `pwm list [--json]`       | Print all accounts, optionally as JSON.                             |
-| `pwm rm <login> [--force]`| Delete an account. `--force` skips the y/N prompt.                  |
-| `pwm update <login>`      | Replace the password for an existing login.                         |
-| `pwm change-master`       | Change the master password (re-encrypts every row atomically).      |
-| `pwm gen [--length N]`    | Print a fresh password to stdout.                                   |
-| `pwm search <query>`      | Substring search over login + email.                                |
-| `pwm export <path>`       | Export all decrypted accounts to a JSON file.                       |
-| `pwm import <path>`       | Import accounts from a JSON file (skips duplicates).                |
+### Системні залежності
 
-Master passwords are always read with [`rpassword`](https://docs.rs/rpassword)
-in TTY mode (no echo, never persisted in shell history) and from a
-single stdin line in non-TTY mode (so `echo "pw" | pwm get foo` works
-in scripts and tests).
+Жодних — Rust-збірка статично лінкує SQLite (`rusqlite/bundled`) та
+OpenSSL (`vendored`), тому окремі пакети `libssl` чи `libsqlite3` НЕ
+потрібні. На Linux достатньо стандартного toolchain (`gcc`, `make`),
+який зазвичай вже є.
 
-## Auto-lock
+---
 
-The interactive menu enforces an idle timeout. Configure it via
+## Збірка та запуск
+
+### Клонування
+
+```bash
+git clone https://github.com/zagordenis1/passwordmanager_rust.git
+cd passwordmanager_rust
+```
+
+### Збірка дебаг-версії (для розробки)
+
+```bash
+cargo build
+./target/debug/pwm --help
+```
+
+### Збірка реліз-версії (швидка, ~7-10 МіБ)
+
+```bash
+cargo build --release
+./target/release/pwm --help
+```
+
+На Windows бінарник буде у `target\release\pwm.exe`.
+
+### Встановлення в `~/.cargo/bin` (щоб запускати як `pwm`)
+
+```bash
+cargo install --path .
+pwm --help
+```
+
+> **Перевірте, що `~/.cargo/bin` у `$PATH`.** На macOS / Linux Bash
+> або Zsh додасть це автоматично після інсталяції rustup; якщо ні —
+> додайте `export PATH="$HOME/.cargo/bin:$PATH"` у `~/.bashrc` /
+> `~/.zshrc`.
+
+### Перший запуск
+
+```bash
+# Створює users.db у поточній теці й запитує master-пароль
+pwm
+
+# Або одразу через підкоманду:
+pwm init
+```
+
+Шлях до БД можна перевизначити:
+
+```bash
+pwm --db /home/user/.local/share/pwm/users.db
+pwm --db ./test.db init
+```
+
+---
+
+## Інтерактивне меню
+
+Запуск без підкоманди відкриває 11-пунктове меню (точна копія
+Python-версії, українською):
+
+```
+=== Password Manager ===
+1)  Додати акаунт
+2)  Знайти акаунт
+3)  Показати всі акаунти
+4)  Видалити акаунт
+5)  Оновити пароль
+6)  Експорт у JSON
+7)  Імпорт з JSON
+8)  Пошук по login/email
+9)  Вихід
+10) Змінити master password
+11) Згенерувати пароль
+```
+
+Master-пароль вводиться один раз на сесію. Після `PM_AUTO_LOCK_SECONDS`
+секунд бездіяльності сесія блокується й треба автентифікуватися
+повторно.
+
+---
+
+## Не-інтерактивні підкоманди
+
+Зручно для скриптів і pipe-композиції:
+
+| Команда                       | Що робить                                                          |
+|-------------------------------|--------------------------------------------------------------------|
+| *(без підкоманди)*            | Інтерактивне меню (11 пунктів, українською).                       |
+| `pwm init`                    | Перше налаштування master-пароля на свіжій БД.                     |
+| `pwm add --login <name>`      | Додати акаунт. Пароль через прихований prompt або `--stdin`.       |
+| `pwm get <login>`             | Вивести пароль у stdout (`--full` — весь запис).                   |
+| `pwm list [--json]`           | Усі акаунти (з опцією JSON-виводу).                                |
+| `pwm rm <login> [--force]`    | Видалити акаунт. `--force` пропускає y/N-підтвердження.            |
+| `pwm update <login>`          | Замінити пароль для існуючого login.                               |
+| `pwm change-master`           | Змінити master-пароль (атомарно перешифровує всі рядки).           |
+| `pwm gen [--length N]`        | Згенерувати пароль і вивести у stdout.                             |
+| `pwm search <query>`          | Підрядковий пошук по login + email.                                |
+| `pwm export <path>`           | Експорт у JSON (UNIX: файл створюється з режимом `0600`).           |
+| `pwm import <path>`           | Імпорт з JSON (дублікати пропускаються за замовчуванням).          |
+
+### Приклади
+
+```bash
+# Додати акаунт, пароль читається із stdin (зручно для CI):
+echo "supersecret" | pwm add --login alice --email alice@example.com --stdin
+
+# Скопіювати пароль у буфер обміну (Linux, Wayland):
+pwm get alice | wl-copy
+
+# Скопіювати пароль у буфер обміну (macOS):
+pwm get alice | pbcopy
+
+# Згенерувати 32-символьний пароль із усіма класами:
+pwm gen --length 32
+
+# Згенерувати тільки літери + цифри (без символів):
+pwm gen --length 24 --no-symbols
+
+# Експорт + імпорт між двома БД:
+pwm --db a.db export backup.json
+pwm --db b.db import backup.json
+
+# JSON-вивід для обробки jq:
+pwm list --json | jq '.[] | .login'
+```
+
+### Прапорці
+
+* `--db <шлях>` — глобальний прапорець для будь-якої підкоманди (за замовчуванням `users.db` у поточній теці).
+* `--version` / `-V` — версія бінарника.
+* `--help` / `-h` — довідка по будь-якій підкоманді (наприклад `pwm add --help`).
+
+Master-пароль завжди читається через
+[`rpassword`](https://docs.rs/rpassword) у TTY-режимі (без луни,
+не зберігається в історії shell). У не-TTY режимі (pipe) — з одного
+рядка stdin, тому `echo "pw" | pwm get foo` працює.
+
+---
+
+## Auto-lock (автоматичне блокування)
+
+Інтерактивне меню має таймер бездіяльності, налаштовується через
 `PM_AUTO_LOCK_SECONDS`:
 
-| Value     | Meaning                                                  |
-|-----------|----------------------------------------------------------|
-| unset     | Default: 300 seconds (5 minutes).                        |
-| `0`       | Disable auto-lock entirely.                              |
-| positive  | Lock after this many seconds of inactivity.              |
-| invalid   | Falls back to the default — never silently disables.     |
+| Значення   | Що означає                                                  |
+|------------|-------------------------------------------------------------|
+| не задано  | За замовчуванням 300 секунд (5 хвилин).                     |
+| `0`        | Повністю вимкнути auto-lock.                                |
+| додатне    | Блокувати після N секунд бездіяльності.                     |
+| некоректне | Падає до значення за замовчуванням, ніколи не вимикає.      |
 
-Items 9 (вихід) and 11 (генератор) are flagged `NO_AUTH_ACTIONS` and
-neither reset the idle timer nor require re-authentication.
+Пункти 9 (вихід) та 11 (генератор) позначені як `NO_AUTH_ACTIONS` —
+вони НЕ скидають таймер бездіяльності й не вимагають повторної
+автентифікації.
 
-## Security model
+```bash
+# Безперервна сесія без блокування:
+PM_AUTO_LOCK_SECONDS=0 pwm
 
-| Concern                     | What this project does                                             |
-|-----------------------------|--------------------------------------------------------------------|
-| Master password in memory   | Wrapped in `secrecy::SecretString` → zeroized on `Drop`.           |
-| Derived Fernet key          | Wrapped in `secrecy::SecretString` → zeroized on `Drop`.           |
-| Default KDF                 | **Argon2id, m=19456 KiB, t=2, p=1, hash_len=32, salt=16 bytes**.   |
-| Legacy KDF (read-only)      | PBKDF2-HMAC-SHA256, 480 000 iterations.                            |
-| Encryption                  | Fernet (AES-128-CBC + HMAC-SHA256), via `cryptography.io`-format.  |
-| Verifier                    | `b"password_manager:verifier:v1"` encrypted with the master key.   |
-| Auto-lock                   | Idle timer in the interactive menu (see above).                    |
-| Logging                     | `Debug` impls redact secrets; no master / key / plaintext logged.  |
-| `unsafe` blocks             | None.                                                              |
-| `unwrap` / `expect` in prod | None — only in tests.                                              |
+# Блокування після 60 секунд:
+PM_AUTO_LOCK_SECONDS=60 pwm
+```
+
+> **Відоме обмеження.** Таймер перевіряється лише між діями
+> користувача. Якщо ви залишили бінарник на промпті меню — ключ
+> залишається в RAM до наступного натискання клавіші. Деталі у
+> `docs/audit-2026-04.md` (M3).
+
+---
+
+## Модель безпеки
+
+| Аспект                            | Як вирішується                                                                                                  |
+|-----------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| Master-пароль у пам'яті           | Передається як `&str` лише на час потреби; на структурі менеджера не зберігається.                              |
+| Похідний ключ KDF (base64-string) | Локальна копія `zeroize()`-ається відразу після створення Fernet.                                               |
+| Активний ключ шифрування          | Зберігається в `Option<Fernet>`. Upstream-крейт `fernet` НЕ zeroize-ить — тому скидаємо через `lock()`.         |
+| Базовий KDF                       | **Argon2id, m=19456 KiB, t=2, p=1, hash_len=32, salt=16 байт** (рекомендація OWASP 2024).                       |
+| Legacy KDF (тільки читання)       | PBKDF2-HMAC-SHA256, 480 000 ітерацій.                                                                           |
+| Шифрування                        | Fernet (AES-128-CBC + HMAC-SHA256), побайтово сумісне з Python `cryptography.fernet`.                            |
+| Verifier (перевірка пароля)       | Шифрований відомий plaintext `b"password_manager:verifier:v1"`.                                                  |
+| Атомарність master-setup          | `BEGIN IMMEDIATE` + recheck всередині транзакції — захист від паралельних `pwm init`.                           |
+| Права на експортний файл          | `0600` (тільки власник) на Unix; виводиться попередження про plaintext-вміст.                                   |
+| Durability SQLite                 | `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`.                                                      |
+| Auto-lock                         | Таймер бездіяльності в інтерактивному меню (див. вище).                                                          |
+| Логування                         | `Debug` redact-ить секрети; master / ключ / plaintext не логуються ніде.                                         |
+| `unsafe`                          | Жодного.                                                                                                         |
+| `unwrap` / `expect` у проді       | Жодного — лише в тестах.                                                                                         |
 
 ### Threat model
 
-In scope:
+**У scope:**
 
-* Stolen `users.db` file with no master password → attacker faces
-  Argon2id with OWASP-recommended cost (memory-hard).
-* Casual swapfile / coredump scraping → master and key are zeroized.
+* Викрадена `users.db` без master-пароля → атакуючому доведеться зламувати Argon2id з OWASP-параметрами.
+* Випадкові свопи / coredump-и → master і базовий ключ обнулюються (наскільки дозволяє upstream `fernet`).
+* Конкурентний запуск `pwm init` → транзакція з reserved-локом не дасть зіпсувати БД.
+* Експортний JSON у спільній теці на Unix → mode `0600` блокує сторонніх читачів.
 
-Out of scope (use OS-level controls instead):
+**Поза scope** (захищайтеся засобами ОС):
 
-* Memory dumps from a privileged attacker on a running process.
-* Compromised compiler / dependency supply chain (`cargo audit` is your
-  friend, but no project of this size can mitigate it alone).
-* Keystroke loggers / shoulder surfing.
+* Дамп пам'яті привілейованим атакуючим на запущеному процесі.
+* Скомпрометований компілятор / supply chain (`cargo audit` допомагає, але не повністю).
+* Кейлогери / shoulder surfing.
 
-## Architecture
+Повний аудит — `docs/audit-2026-04.md`.
+
+---
+
+## Архітектура
 
 ```
 src/
-├── lib.rs           # Library re-exports (used by both bin and tests)
-├── main.rs          # `pwm` binary entry point
+├── lib.rs           # Library re-exports (бінарник + тести)
+├── main.rs          # Точка входу `pwm`
 ├── crypto.rs        # Argon2id + PBKDF2 + Fernet helpers + verifier
-├── db.rs            # SQLite schema and `meta` accessors
+├── db.rs            # SQLite-схема та meta-аксесори
 ├── manager.rs       # `PasswordManager`: lock/unlock/CRUD lifecycle
-├── generator.rs     # CSPRNG-based password generator
+├── generator.rs     # Генератор паролів на CSPRNG
 └── cli/
-    ├── mod.rs          # `clap` parser + dispatcher
-    ├── interactive.rs  # 11-item Ukrainian menu (Python-compatible)
-    └── commands.rs     # Non-interactive subcommands
+    ├── mod.rs          # Парсер `clap` + диспетчер
+    ├── interactive.rs  # 11-пунктове українське меню
+    └── commands.rs     # Не-інтерактивні підкоманди
 
 tests/
-├── manager_tests.rs       # Public API integration tests
-├── e2e_cli.rs             # Real binary via `assert_cmd`
-├── auto_lock.rs           # Auto-lock semantics
-└── cross_compat_python.rs # Open Python-created DB & vice versa
+├── manager_tests.rs       # Інтеграційні тести публічного API
+├── e2e_cli.rs             # Реальний бінарник через `assert_cmd`
+├── auto_lock.rs           # Семантика auto-lock
+└── cross_compat_python.rs # Відкриваємо Python-БД і навпаки
 ```
 
-## Tests
+---
+
+## Тести
 
 ```bash
-cargo test                # Unit + integration + e2e + cross-compat
-cargo clippy -- -D warnings
-cargo fmt --check
+cargo test                       # Усі тести
+cargo test --lib                 # Тільки unit-тести
+cargo test --test e2e_cli        # Тільки CLI e2e
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
-The `cross_compat_python` suite is silently skipped when `python3` is not
-on `$PATH` or when `cryptography` / `argon2-cffi` are not importable. CI
-installs them so the suite runs there unconditionally.
+`cross_compat_python` пропускається, якщо `python3` відсутній у `$PATH`
+або якщо `cryptography` / `argon2-cffi` неможливо імпортувати. У CI
+вони встановлюються, тому suite виконується безумовно.
 
-## Building a release binary
+Загалом 56 тестів: 38 unit + 3 інтеграційні + 10 e2e + 2 auto-lock + 3
+cross-compat.
+
+---
+
+## Реліз-бінарник
 
 ```bash
 cargo build --release
-ls -lh target/release/pwm
+ls -lh target/release/pwm        # Linux / macOS
+dir target\release\pwm.exe       # Windows (PowerShell)
 ```
 
-`cargo`'s release profile applies `lto = "thin"`, `codegen-units = 1`,
-and `strip = true`, producing a single static binary under 10 MiB on
-x86_64 Linux.
+Профіль `release` в `Cargo.toml` застосовує `lto = "thin"`,
+`codegen-units = 1`, `strip = true` — отриманий статичний бінарник на
+x86_64 Linux менший за 10 МіБ (типово 7-8 МіБ).
 
-## Migrating from the Python version
+---
 
-See [`MIGRATION.md`](MIGRATION.md) — the short answer is "copy your
-`users.db` to wherever the Rust binary runs, no re-encryption needed".
+## Міграція з Python-версії
 
-## License
+Дивись [`MIGRATION.md`](MIGRATION.md). Коротко: скопіюйте свій
+`users.db` туди, де запускається Rust-бінарник — нічого
+перешифровувати не треба.
 
-Dual-licensed under MIT or Apache-2.0, at your option.
+```bash
+cp ~/old-python-pwm/users.db ./users.db
+pwm list   # буде попередження про PBKDF2 → запустіть `pwm change-master` для міграції на Argon2id
+```
+
+---
+
+## Ліцензія
+
+MIT OR Apache-2.0.
