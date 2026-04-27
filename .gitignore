@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local databases / exports created during testing.
+*.db
+*.db-journal
+export.json
+users.db
