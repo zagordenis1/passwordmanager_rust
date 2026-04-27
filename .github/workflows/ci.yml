@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Python deps for the cross-compat tests. Use a dedicated venv so we
+      # don't trip over PEP 668 ("externally-managed-environment") on
+      # the macOS Homebrew Python. Skipped on Windows because building
+      # `argon2-cffi` from source on the GitHub-hosted Windows runner is
+      # fiddly; Linux + macOS provide enough cross-compat coverage and
+      # the dedicated `cross-compat` job below covers the full matrix.
+      - name: Install Python crypto libs (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          python3 -m venv "$HOME/pwm-venv"
+          "$HOME/pwm-venv/bin/pip" install --upgrade pip
+          "$HOME/pwm-venv/bin/pip" install cryptography argon2-cffi
+          # Expose the venv's python3 first on PATH so the cross-compat
+          # tests' `Command::new("python3")` picks it up.
+          echo "$HOME/pwm-venv/bin" >> "$GITHUB_PATH"
+      - name: cargo test
+        run: cargo test --all-targets
+
+  cross-compat:
+    name: cross-compat with Python reference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install cryptography argon2-cffi
+      - run: cargo test --test cross_compat_python -- --nocapture
+
+  release-binary:
+    name: release binary size sanity check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Print binary size
+        run: |
+          ls -lh target/release/pwm
+          size=$(stat -c%s target/release/pwm)
+          echo "binary size: $size bytes"
+          if [ "$size" -gt 10485760 ]; then
+            echo "ERROR: binary > 10 MiB"
+            exit 1
+          fi
