@@ -10,6 +10,11 @@ written by either side is readable by the other when the master password
 is the same. The default KDF is Argon2id; PBKDF2-SHA256 is preserved as
 a read-only legacy fallback for old DBs.
 
+> 📖 **End-user manual** (Ukrainian / Russian) with step-by-step
+> walkthroughs of every subcommand, every menu item, export/import
+> edge-cases, backup, scripting, and troubleshooting:
+> [`USAGE.md`](USAGE.md) · [`USAGE.ru.md`](USAGE.ru.md).
+
 ## Quickstart
 
 ```bash
