@@ -279,17 +279,30 @@ fn export(manager: &mut PasswordManager, path: &str) -> Result<i32> {
     read_master_for_existing(manager)?;
     let n = manager.export_to_json(path)?;
     println!("Експортовано {n} акаунтів у {path}.");
-    eprintln!(
-        "Увага: файл {path:?} містить ВСІ паролі у відкритому вигляді. \
-         На Unix його створено з режимом 0600 (тільки власник). \
-         Видаліть його після використання."
-    );
+    if cfg!(unix) {
+        eprintln!(
+            "Увага: файл {path:?} містить ВСІ паролі у відкритому вигляді. \
+             На Unix його створено з режимом 0600 (тільки власник). \
+             Видаліть його після використання."
+        );
+    } else {
+        eprintln!(
+            "Увага: файл {path:?} містить ВСІ паролі у відкритому вигляді. \
+             На цій ОС стандартний open() не виставляє жорсткіших ACL — \
+             збережіть файл у каталозі вашого профілю та видаліть його \
+             після використання."
+        );
+    }
     Ok(0)
 }
 
 fn import(manager: &mut PasswordManager, path: &str, skip_duplicates: bool) -> Result<i32> {
     read_master_for_existing(manager)?;
     let n = manager.import_from_json(path, skip_duplicates)?;
-    println!("Імпортовано {n} нових акаунтів (дублікати пропущено).");
+    if skip_duplicates {
+        println!("Імпортовано {n} нових акаунтів (дублікати пропущено).");
+    } else {
+        println!("Імпортовано {n} нових акаунтів.");
+    }
     Ok(0)
 }

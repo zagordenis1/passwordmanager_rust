@@ -81,10 +81,14 @@ pub enum CryptoError {
     InvalidToken,
 }
 
-/// Generate a fresh `SALT_SIZE`-byte salt from the OS CSPRNG.
+/// Generate a fresh `SALT_SIZE`-byte salt from a cryptographically
+/// secure RNG.
 ///
-/// Uses `rand::thread_rng()` which on every supported platform pulls
-/// entropy from `getrandom(2)` / `BCryptGenRandom` / `arc4random_buf`.
+/// Uses [`rand::thread_rng`] — a userspace ChaCha-based CSPRNG seeded
+/// from the OS entropy source (`getrandom(2)` / `BCryptGenRandom` /
+/// `arc4random_buf`) and periodically reseeded. This is suitable for
+/// cryptographic use per the `rand` crate documentation; the salt is
+/// public and unique-per-DB so a per-call OS syscall is unnecessary.
 #[must_use]
 pub fn generate_salt() -> Vec<u8> {
     let mut salt = vec![0u8; SALT_SIZE];
@@ -117,7 +121,7 @@ pub fn derive_key(
     validate_inputs(master_password, salt)?;
     match kdf_version {
         KDF_ARGON2ID_V1 => derive_key_argon2id(master_password, salt),
-        KDF_PBKDF2_LEGACY => derive_key_pbkdf2(master_password, salt),
+        KDF_PBKDF2_LEGACY => Ok(derive_key_pbkdf2(master_password, salt)),
         other => Err(CryptoError::UnknownKdf(other.to_string())),
     }
 }
@@ -142,7 +146,7 @@ fn derive_key_argon2id(master_password: &str, salt: &[u8]) -> Result<String, Cry
     Ok(key)
 }
 
-fn derive_key_pbkdf2(master_password: &str, salt: &[u8]) -> Result<String, CryptoError> {
+fn derive_key_pbkdf2(master_password: &str, salt: &[u8]) -> String {
     let mut raw = [0u8; 32];
     pbkdf2_hmac::<Sha256>(
         master_password.as_bytes(),
@@ -152,7 +156,7 @@ fn derive_key_pbkdf2(master_password: &str, salt: &[u8]) -> Result<String, Crypt
     );
     let key = URL_SAFE.encode(raw);
     raw.zeroize();
-    Ok(key)
+    key
 }
 
 /// Build a [`Fernet`] from a base64 key produced by [`derive_key`].

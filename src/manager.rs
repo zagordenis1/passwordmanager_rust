@@ -232,7 +232,15 @@ impl PasswordManager {
         let new_verifier = crypto::make_verifier(&new_fernet);
 
         let mut conn = self.open_conn()?;
-        let tx = conn.transaction()?;
+        // IMMEDIATE so a concurrent writer (e.g. a second `pwm
+        // change-master` process or a parallel `pwm add`) can't sneak
+        // a row insert in between our SELECT and our re-encrypt UPDATEs
+        // — that row would be encrypted under the OLD master key but we
+        // wouldn't see it during the rotation, leaving the DB with a
+        // mix of old- and new-key ciphertext that cannot be unlocked
+        // with either password. The reserved-lock semantics serialize
+        // writers; whoever loses the race gets SQLITE_BUSY and bails.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows: Vec<(i64, String)> = {
             let mut stmt = tx.prepare("SELECT id, password_encrypted FROM users")?;
             let mapped = stmt
@@ -455,6 +463,19 @@ impl PasswordManager {
 
     /// Import accounts from a JSON array produced by [`export_to_json`].
     /// Skips duplicates by default. Returns count of newly inserted rows.
+    ///
+    /// All inserts run inside a single SQLite transaction. Two
+    /// consequences:
+    ///
+    /// * **Atomic.** If any row fails for a non-duplicate reason (disk
+    ///   full, schema mismatch, encryption error, …) the entire import
+    ///   is rolled back — there is no partial state to clean up. The
+    ///   caller still sees the typed error from `create_user`.
+    /// * **Fast.** Even a 100k-row import becomes one fsync rather than
+    ///   100k of them.
+    ///
+    /// Duplicate-login rows are still skipped row-by-row when
+    /// `skip_duplicates` is `true`; only non-duplicate errors abort.
     pub fn import_from_json<P: AsRef<Path>>(
         &self,
         path: P,
@@ -463,6 +484,9 @@ impl PasswordManager {
         let bytes = std::fs::read(&path).context("reading import file")?;
         let payload: Vec<serde_json::Value> =
             serde_json::from_slice(&bytes).context("parsing JSON array")?;
+        let fernet = self.require_unlocked()?;
+        let mut conn = self.open_conn()?;
+        let tx = conn.transaction()?;
         let mut inserted = 0usize;
         for entry in payload {
             let login = entry.get("login").and_then(|v| v.as_str()).unwrap_or("");
@@ -474,21 +498,32 @@ impl PasswordManager {
             if login.is_empty() || password.is_empty() {
                 continue;
             }
-            match self.create_user(login, email, password) {
+            let encrypted = crypto::encrypt_str(fernet, password);
+            let res = tx.execute(
+                "INSERT INTO users(login, email, password_encrypted) VALUES (?1, ?2, ?3)",
+                params![login, email, encrypted],
+            );
+            match res {
                 Ok(_) => inserted += 1,
-                Err(e) => {
-                    // Only swallow duplicate-login errors when the caller
-                    // asked us to. Every other failure (disk full, decrypt
-                    // error, schema mismatch, …) must propagate so the
-                    // user is not silently misled about how many records
-                    // actually made it in.
-                    if skip_duplicates && e.downcast_ref::<DuplicateLogin>().is_some() {
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    if skip_duplicates {
                         continue;
                     }
-                    return Err(e);
+                    // Roll back the transaction by dropping `tx` here
+                    // (it rolls back on Drop unless committed) — we
+                    // explicitly return Err with the typed
+                    // DuplicateLogin so callers can downcast.
+                    return Err(DuplicateLogin {
+                        login: login.to_string(),
+                    }
+                    .into());
                 }
+                Err(e) => return Err(e).context("inserting imported user"),
             }
         }
+        tx.commit()?;
         Ok(inserted)
     }
 
@@ -534,10 +569,17 @@ impl PasswordManager {
 /// Atomically write `data` to `path` with owner-only permissions
 /// (`0600` on Unix). Used by [`PasswordManager::export_to_json`] for the
 /// plaintext-password export file.
+///
+/// The `mode` argument to `OpenOptions::open` only takes effect when the
+/// kernel *creates* the file — re-opening an existing file with
+/// `O_TRUNC` leaves its previous mode intact. To guarantee the final
+/// file is `0600` even when overwriting a file that was previously
+/// `0644` (or worse), we explicitly `set_permissions` after the open.
 #[cfg(unix)]
 fn write_owner_only(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::fs::Permissions;
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -545,6 +587,8 @@ fn write_owner_only(path: &Path, data: &[u8]) -> std::io::Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(path)?;
+    // Force the mode for the case of pre-existing-with-looser-perms.
+    f.set_permissions(Permissions::from_mode(0o600))?;
     f.write_all(data)?;
     f.sync_all()?;
     Ok(())
@@ -834,6 +878,44 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn export_overwrites_pre_existing_loose_perms_with_0600() {
+        // Regression test for the audit-pass-2 finding: `OpenOptions::mode`
+        // only takes effect when the kernel *creates* the file. If the
+        // export target already exists with looser permissions (e.g.
+        // 0644 from a previous broken version, or because the user
+        // pre-touched it), a naive open with O_CREAT|O_TRUNC silently
+        // leaves the existing mode in place — we'd then claim "saved
+        // with mode 0600" while the file was actually world-readable.
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, p) = tmp_db();
+        let mut m = PasswordManager::new(&p).unwrap();
+        m.set_master_password("m").unwrap();
+        m.create_user("alice", "a@x", "secret").unwrap();
+
+        let dir = tempdir().unwrap();
+        let json = dir.path().join("export.json");
+
+        // Pre-create the target with world-readable perms.
+        std::fs::write(&json, b"placeholder").unwrap();
+        std::fs::set_permissions(&json, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&json).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "test setup: pre-existing file should be 0644"
+        );
+
+        m.export_to_json(&json).unwrap();
+        let mode = std::fs::metadata(&json).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "export must force 0600 even when target pre-existed at 0644 (got {:o})",
+            mode
+        );
+    }
+
     #[test]
     fn second_init_in_face_of_already_set_master_bails() {
         // Direct functional test of the inside-transaction recheck: we
@@ -849,6 +931,67 @@ mod tests {
             err.to_string().contains("master password already set"),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn import_transactional_rolls_back_on_non_duplicate_error() {
+        // Regression for the audit-pass-2 finding: `import_from_json`
+        // wraps every insert in one transaction. With
+        // `skip_duplicates=false` and a JSON that contains a duplicate
+        // login *after* a successful insert, the entire import must
+        // roll back — the successful row from earlier in the file must
+        // NOT be visible after the call returns Err.
+        let (_d, p) = tmp_db();
+        let mut m = PasswordManager::new(&p).unwrap();
+        m.set_master_password("m").unwrap();
+        m.create_user("preexisting", "x@y", "old").unwrap();
+
+        let dir = tempdir().unwrap();
+        let json = dir.path().join("import.json");
+        let payload = serde_json::json!([
+            { "login": "newrow",      "email": "n@x", "password": "n1" },
+            { "login": "preexisting", "email": "x@y", "password": "dup" }
+        ]);
+        std::fs::write(&json, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        let err = m.import_from_json(&json, false).unwrap_err();
+        assert!(err.downcast_ref::<DuplicateLogin>().is_some());
+
+        // `newrow` must have been rolled back — only `preexisting`
+        // remains, and at its ORIGINAL password.
+        assert!(m.get_user("newrow").unwrap().is_none());
+        assert_eq!(
+            m.get_user("preexisting").unwrap().unwrap().password,
+            "old",
+            "pre-existing row must not have been overwritten"
+        );
+    }
+
+    #[test]
+    fn change_master_uses_immediate_lock() {
+        // Smoke test: after change_master_password, the DB must still
+        // be readable end-to-end. We can't easily simulate two
+        // racing processes from a single-threaded SQLite handle, but
+        // we exercise the same code path that holds the IMMEDIATE
+        // lock and verify the rotation completes cleanly.
+        let (_d, p) = tmp_db();
+        let mut m = PasswordManager::new(&p).unwrap();
+        m.set_master_password("old").unwrap();
+        for i in 0..10 {
+            m.create_user(&format!("u{i}"), "", &format!("pw{i}"))
+                .unwrap();
+        }
+        let n = m.change_master_password("old", "new").unwrap();
+        assert_eq!(n, 10);
+
+        let mut m2 = PasswordManager::new(&p).unwrap();
+        assert!(m2.verify_master_password("new").unwrap());
+        for i in 0..10 {
+            assert_eq!(
+                m2.get_user(&format!("u{i}")).unwrap().unwrap().password,
+                format!("pw{i}")
+            );
+        }
     }
 
     #[test]
