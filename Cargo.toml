@@ -29,8 +29,13 @@ fernet = "0.2"
 # on Windows runners where libssl is not available, without changing what
 # `fernet` does on Linux/macOS where the system OpenSSL is preferred.
 openssl = { version = "0.10", features = ["vendored"] }
-pbkdf2 = { version = "0.12", features = ["simple"] }
-hmac = "0.12"
+# `pbkdf2` is used in legacy-KDF mode only. We need only the low-level
+# `pbkdf2_hmac` function — no `password-hash` PHC string support — so
+# we disable default features and keep only the `hmac` feature that
+# gates `pbkdf2_hmac`. The crate's `simple` feature (and its
+# `password-hash` dep, which pulls in `password-hash` + `subtle` +
+# `base64ct`) is unused here.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sha2 = "0.10"
 rpassword = "7"
 zeroize = { version = "1", features = ["derive"] }

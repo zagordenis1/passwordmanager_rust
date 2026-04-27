@@ -1,9 +1,10 @@
 //! Cryptographically secure password generator.
 //!
-//! Always uses `rand::rngs::OsRng` (which on every supported platform pulls
-//! entropy from the OS — `getrandom(2)` / `BCryptGenRandom` /
-//! `arc4random_buf`). Never use the seeded PRNGs from `rand` for password
-//! material.
+//! Uses [`rand::thread_rng`] — a userspace ChaCha-based CSPRNG that is
+//! seeded from the OS entropy source (`getrandom(2)` /
+//! `BCryptGenRandom` / `arc4random_buf`) and periodically reseeded. The
+//! `rand` crate documents this as suitable for cryptographic use; we
+//! deliberately do **not** use a seeded / deterministic PRNG here.
 //!
 //! Default policy: 20 characters, all four character classes
 //! (lower / upper / digit / symbol). The generator guarantees that every
