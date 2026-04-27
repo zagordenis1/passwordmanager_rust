@@ -24,6 +24,11 @@ clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 argon2 = "0.5"
 fernet = "0.2"
+# Force `openssl-sys` (transitive via `fernet`) to build OpenSSL from source
+# rather than rely on a system install. Keeps the build working out-of-the-box
+# on Windows runners where libssl is not available, without changing what
+# `fernet` does on Linux/macOS where the system OpenSSL is preferred.
+openssl = { version = "0.10", features = ["vendored"] }
 pbkdf2 = { version = "0.12", features = ["simple"] }
 hmac = "0.12"
 sha2 = "0.10"

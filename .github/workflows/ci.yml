@@ -45,14 +45,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Python deps for the cross-compat tests. Skipped on Windows because
-      # building `argon2-cffi` from source on the GitHub-hosted Windows
-      # runner is fiddly; Linux+macOS provide enough cross-compat coverage.
+      # Python deps for the cross-compat tests. Use a dedicated venv so we
+      # don't trip over PEP 668 ("externally-managed-environment") on
+      # the macOS Homebrew Python. Skipped on Windows because building
+      # `argon2-cffi` from source on the GitHub-hosted Windows runner is
+      # fiddly; Linux + macOS provide enough cross-compat coverage and
+      # the dedicated `cross-compat` job below covers the full matrix.
       - name: Install Python crypto libs (Unix)
         if: runner.os != 'Windows'
         run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install cryptography argon2-cffi
+          python3 -m venv "$HOME/pwm-venv"
+          "$HOME/pwm-venv/bin/pip" install --upgrade pip
+          "$HOME/pwm-venv/bin/pip" install cryptography argon2-cffi
+          # Expose the venv's python3 first on PATH so the cross-compat
+          # tests' `Command::new("python3")` picks it up.
+          echo "$HOME/pwm-venv/bin" >> "$GITHUB_PATH"
       - name: cargo test
         run: cargo test --all-targets
 
