@@ -31,6 +31,16 @@ pub const META_SALT: &str = "salt";
 pub const META_VERIFIER: &str = "verifier";
 pub const META_KDF: &str = "kdf_version";
 
+/// Error returned from [`PasswordManager::create_user`] when a row with
+/// the same `login` already exists. Wrapped in `anyhow::Error` for the
+/// public API; callers can `downcast_ref::<DuplicateLogin>()` to react
+/// specifically (e.g. import-with-skip-duplicates).
+#[derive(Debug, thiserror::Error)]
+#[error("login {login:?} already exists")]
+pub struct DuplicateLogin {
+    pub login: String,
+}
+
 /// Plain-text view of a stored account (password decrypted). Returned to
 /// the CLI / library callers; never persisted in this form.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,10 +118,17 @@ impl PasswordManager {
         let fernet = crypto::fernet_from_key(&key).context("building Fernet")?;
         let verifier = crypto::make_verifier(&fernet);
 
-        let conn = self.open_conn()?;
-        db::set_meta(&conn, META_SALT, &salt)?;
-        db::set_meta(&conn, META_VERIFIER, verifier.as_bytes())?;
-        db::set_meta(&conn, META_KDF, KDF_ARGON2ID_V1.as_bytes())?;
+        // All-or-nothing: a crash between writes would otherwise leave the
+        // DB with salt+verifier but no kdf_version, permanently bricking it
+        // (verify would default to PBKDF2 instead of Argon2id).
+        let mut conn = self.open_conn()?;
+        let tx = conn.transaction()?;
+        let upsert = "INSERT INTO meta(key, value) VALUES (?1, ?2) \
+                      ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+        tx.execute(upsert, params![META_SALT, &salt])?;
+        tx.execute(upsert, params![META_VERIFIER, verifier.as_bytes()])?;
+        tx.execute(upsert, params![META_KDF, KDF_ARGON2ID_V1.as_bytes()])?;
+        tx.commit()?;
 
         self.fernet = Some(fernet);
         self.key = Some(SecretString::new(key));
@@ -259,6 +276,10 @@ impl PasswordManager {
 
     /// Insert a new account. Returns the freshly-decrypted record.
     /// Errors on duplicate `login` or empty `login`.
+    ///
+    /// Duplicate-login errors are reported as [`DuplicateLogin`], wrapped
+    /// in `anyhow::Error`. Callers that want to special-case duplicates
+    /// (e.g. [`PasswordManager::import_from_json`]) can downcast.
     pub fn create_user(&self, login: &str, email: &str, password: &str) -> Result<UserRecord> {
         if login.is_empty() {
             bail!("login must not be empty");
@@ -275,7 +296,10 @@ impl PasswordManager {
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
-                bail!("login {:?} already exists", login)
+                return Err(DuplicateLogin {
+                    login: login.to_string(),
+                }
+                .into());
             }
             Err(e) => return Err(e).context("inserting user"),
         };
@@ -350,13 +374,23 @@ impl PasswordManager {
     }
 
     /// Case-insensitive substring search over login + email.
+    ///
+    /// `%`, `_` and `\\` in `query` are escaped so they are matched as
+    /// literals rather than as SQL `LIKE` wildcards.
     pub fn search(&self, query: &str) -> Result<Vec<UserRecord>> {
         let fernet = self.require_unlocked()?;
-        let like = format!("%{}%", query);
+        // Escape LIKE metacharacters so user input is matched literally.
+        // The backslash *must* be escaped first or we'd double-escape the
+        // escapes added by the next two replacements.
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like = format!("%{}%", escaped);
         let conn = self.open_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, login, email, password_encrypted, created_at FROM users \
-             WHERE login LIKE ?1 OR IFNULL(email,'') LIKE ?1 \
+             WHERE login LIKE ?1 ESCAPE '\\' OR IFNULL(email,'') LIKE ?1 ESCAPE '\\' \
              ORDER BY id",
         )?;
         let rows = stmt
@@ -409,9 +443,15 @@ impl PasswordManager {
             match self.create_user(login, email, password.unwrap()) {
                 Ok(_) => inserted += 1,
                 Err(e) => {
-                    if !skip_duplicates {
-                        return Err(e);
+                    // Only swallow duplicate-login errors when the caller
+                    // asked us to. Every other failure (disk full, decrypt
+                    // error, schema mismatch, …) must propagate so the
+                    // user is not silently misled about how many records
+                    // actually made it in.
+                    if skip_duplicates && e.downcast_ref::<DuplicateLogin>().is_some() {
+                        continue;
                     }
+                    return Err(e);
                 }
             }
         }
@@ -618,6 +658,74 @@ mod tests {
         // Importing again — duplicates skipped.
         let again = m2.import_from_json(&json, true).unwrap();
         assert_eq!(again, 0);
+    }
+
+    #[test]
+    fn create_user_returns_typed_duplicate_login_error() {
+        let (_d, p) = tmp_db();
+        let mut m = PasswordManager::new(&p).unwrap();
+        m.set_master_password("m").unwrap();
+        m.create_user("alice", "a@x", "p1").unwrap();
+        let err = m.create_user("alice", "a@x", "p2").unwrap_err();
+        assert!(
+            err.downcast_ref::<DuplicateLogin>().is_some(),
+            "expected DuplicateLogin, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn import_skips_duplicates_only_not_other_errors() {
+        // Build an export, then re-import into a DB that already has the
+        // same login → exactly one row already present → import_from_json
+        // should report 0 inserts (skip_duplicates=true) and *not* fail.
+        let (_d1, p1) = tmp_db();
+        let mut m1 = PasswordManager::new(&p1).unwrap();
+        m1.set_master_password("m").unwrap();
+        m1.create_user("alice", "a@x", "p1").unwrap();
+        let json_path = _d1.path().join("dump.json");
+        m1.export_to_json(&json_path).unwrap();
+
+        let (_d2, p2) = tmp_db();
+        let mut m2 = PasswordManager::new(&p2).unwrap();
+        m2.set_master_password("m").unwrap();
+        m2.create_user("alice", "a@x", "preexisting").unwrap();
+
+        // skip_duplicates=true → the alice row in JSON collides, is
+        // skipped, no error surfaces. The original row is preserved.
+        let inserted = m2.import_from_json(&json_path, true).unwrap();
+        assert_eq!(inserted, 0);
+        assert_eq!(
+            m2.get_user("alice").unwrap().unwrap().password,
+            "preexisting"
+        );
+
+        // skip_duplicates=false → same import fails loudly (and the typed
+        // error is still a DuplicateLogin downcastable from anyhow).
+        let err = m2.import_from_json(&json_path, false).unwrap_err();
+        assert!(err.downcast_ref::<DuplicateLogin>().is_some());
+    }
+
+    #[test]
+    fn search_treats_like_metacharacters_as_literals() {
+        let (_d, p) = tmp_db();
+        let mut m = PasswordManager::new(&p).unwrap();
+        m.set_master_password("m").unwrap();
+        m.create_user("alice", "a@x", "p").unwrap();
+        m.create_user("bob_smith", "b@x", "p").unwrap();
+        m.create_user("100%real", "c@x", "p").unwrap();
+
+        // `%` should match only the literal-percent row, not all rows.
+        let pct = m.search("%").unwrap();
+        assert_eq!(pct.len(), 1);
+        assert_eq!(pct[0].login, "100%real");
+
+        // `_` should match only the underscore row, not "any single char".
+        let und = m.search("_").unwrap();
+        assert_eq!(und.len(), 1);
+        assert_eq!(und[0].login, "bob_smith");
+
+        // Plain queries still work.
+        assert_eq!(m.search("ali").unwrap().len(), 1);
     }
 
     #[test]

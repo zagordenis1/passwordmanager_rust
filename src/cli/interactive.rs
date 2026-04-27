@@ -6,7 +6,7 @@
 
 use std::env;
 use std::io::{self, BufRead, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -389,16 +389,24 @@ fn generate_action(_manager: &mut PasswordManager) -> Result<(), UserAbort> {
     Ok(())
 }
 
+/// Pure idle-window predicate: `true` iff the session is still considered
+/// active and the caller does NOT need to re-authenticate.
+///
+/// `timeout_secs == 0` disables auto-lock entirely. Otherwise we use a
+/// strict `<` against `Duration::from_secs(timeout_secs)` so the boundary
+/// case (exactly `timeout_secs` elapsed) locks, matching the README's
+/// "Lock after this many seconds of inactivity" wording.
+fn within_idle_window(elapsed: Duration, timeout_secs: u64) -> bool {
+    timeout_secs == 0 || elapsed < Duration::from_secs(timeout_secs)
+}
+
 fn ensure_unlocked(
     manager: &mut PasswordManager,
     last_activity: Instant,
     timeout_secs: u64,
     now: Instant,
 ) -> Result<bool, UserAbort> {
-    if timeout_secs == 0 {
-        return Ok(true);
-    }
-    if now.duration_since(last_activity).as_secs() <= timeout_secs {
+    if within_idle_window(now.duration_since(last_activity), timeout_secs) {
         return Ok(true);
     }
     manager.lock();
@@ -478,5 +486,30 @@ pub fn run(db_path: &str) -> Result<i32> {
             println!("\nДо побачення.");
             Ok(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn within_idle_window_disabled_by_zero_timeout() {
+        // Any elapsed value is fine when timeout is 0 (auto-lock off).
+        assert!(within_idle_window(Duration::from_secs(0), 0));
+        assert!(within_idle_window(Duration::from_secs(10_000), 0));
+    }
+
+    #[test]
+    fn within_idle_window_strict_boundary() {
+        // Exactly `timeout_secs` elapsed must lock (returns false).
+        assert!(!within_idle_window(Duration::from_secs(300), 300));
+        // One sub-second short of the boundary still active.
+        assert!(within_idle_window(
+            Duration::from_secs(299) + Duration::from_millis(999),
+            300
+        ));
+        // Past boundary always locks.
+        assert!(!within_idle_window(Duration::from_secs(301), 300));
     }
 }

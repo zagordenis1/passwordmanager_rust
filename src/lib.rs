@@ -20,4 +20,4 @@ pub mod manager;
 
 pub mod cli;
 
-pub use manager::{PasswordManager, UserRecord, DEFAULT_DB_PATH};
+pub use manager::{DuplicateLogin, PasswordManager, UserRecord, DEFAULT_DB_PATH};
